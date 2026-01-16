@@ -624,8 +624,6 @@ struct BulkStaging {
     anchor: RepoPath,
 }
 
-const MAX_PANEL_EDITOR_LINES: usize = 6;
-
 pub(crate) fn commit_message_editor(
     commit_message_buffer: Entity<Buffer>,
     placeholder: Option<SharedString>,
@@ -635,10 +633,18 @@ pub(crate) fn commit_message_editor(
     cx: &mut Context<Editor>,
 ) -> Editor {
     let buffer = cx.new(|cx| MultiBuffer::singleton(commit_message_buffer, cx));
-    let max_lines = if in_panel { MAX_PANEL_EDITOR_LINES } else { 18 };
+    let (min_lines, max_lines) = if in_panel {
+        let settings = GitPanelSettings::get_global(cx);
+        (
+            settings.commit_editor_min_lines,
+            settings.commit_editor_max_lines(),
+        )
+    } else {
+        (18, 18)
+    };
     let mut commit_editor = Editor::new(
         EditorMode::AutoHeight {
-            min_lines: max_lines,
+            min_lines,
             max_lines: Some(max_lines),
         },
         buffer,
@@ -673,11 +679,17 @@ impl GitPanel {
             let focus_handle = cx.focus_handle();
             cx.on_focus(&focus_handle, window, Self::focus_in).detach();
 
-            let mut was_sort_by_path = GitPanelSettings::get_global(cx).sort_by_path;
-            let mut was_tree_view = GitPanelSettings::get_global(cx).tree_view;
+            let settings = GitPanelSettings::get_global(cx);
+            let mut was_sort_by_path = settings.sort_by_path;
+            let mut was_tree_view = settings.tree_view;
+            let mut was_commit_editor_min_lines = settings.commit_editor_min_lines;
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
-                let sort_by_path = GitPanelSettings::get_global(cx).sort_by_path;
-                let tree_view = GitPanelSettings::get_global(cx).tree_view;
+                let settings = GitPanelSettings::get_global(cx);
+                let sort_by_path = settings.sort_by_path;
+                let tree_view = settings.tree_view;
+                let commit_editor_min_lines = settings.commit_editor_min_lines;
+                let commit_editor_max_lines = settings.commit_editor_max_lines();
+
                 if tree_view != was_tree_view {
                     this.view_mode = GitPanelViewMode::from_settings(cx);
                 }
@@ -685,8 +697,19 @@ impl GitPanel {
                     this.bulk_staging.take();
                     this.update_visible_entries(window, cx);
                 }
+                if commit_editor_min_lines != was_commit_editor_min_lines {
+                    this.commit_editor.update(cx, |editor, _cx| {
+                        editor.set_mode(EditorMode::AutoHeight {
+                            min_lines: commit_editor_min_lines,
+                            max_lines: Some(commit_editor_max_lines),
+                        });
+                    });
+                    cx.notify();
+                }
+
                 was_sort_by_path = sort_by_path;
                 was_tree_view = tree_view;
+                was_commit_editor_min_lines = commit_editor_min_lines;
             })
             .detach();
 
@@ -4203,12 +4226,16 @@ impl GitPanel {
         let head_commit = active_repository.read(cx).head_commit.clone();
 
         let footer_size = px(32.);
-        let gap = px(9.0);
-        let max_height = panel_editor_style
+        let settings = GitPanelSettings::get_global(cx);
+        let line_height = panel_editor_style
             .text
-            .line_height_in_pixels(window.rem_size())
-            * MAX_PANEL_EDITOR_LINES
-            + gap;
+            .line_height_in_pixels(window.rem_size());
+
+        let commit_editor_min_lines = settings.commit_editor_min_lines as f32;
+        let commit_editor_max_lines = settings.commit_editor_max_lines() as f32;
+
+        let min_height = line_height * commit_editor_min_lines;
+        let max_height = line_height * commit_editor_max_lines;
 
         let git_panel = cx.entity();
         let display_name = SharedString::from(Arc::from(
@@ -4218,7 +4245,7 @@ impl GitPanel {
                 .trim_end_matches("/"),
         ));
         let editor_is_long = self.commit_editor.update(cx, |editor, cx| {
-            editor.max_point(cx).row().0 >= MAX_PANEL_EDITOR_LINES as u32
+            editor.max_point(cx).row().0 >= commit_editor_max_lines as u32
         });
 
         let footer = v_flex()
@@ -4228,12 +4255,16 @@ impl GitPanel {
                 head_commit,
                 Some(git_panel),
             ))
+            .v_flex()
+            .w_full()
+            .h_auto()
             .child(
                 panel_editor_container(window, cx)
                     .id("commit-editor-container")
-                    .relative()
+                    .flex_1()
                     .w_full()
-                    .h(max_height + footer_size)
+                    .h_auto()
+                    .pb_0()
                     .border_t_1()
                     .border_color(cx.theme().colors().border)
                     .cursor_text()
@@ -4241,33 +4272,9 @@ impl GitPanel {
                         window.focus(&this.commit_editor.focus_handle(cx), cx);
                     }))
                     .child(
-                        h_flex()
-                            .id("commit-footer")
-                            .border_t_1()
-                            .when(editor_is_long, |el| {
-                                el.border_color(cx.theme().colors().border_variant)
-                            })
-                            .absolute()
-                            .bottom_0()
-                            .left_0()
-                            .w_full()
-                            .px_2()
-                            .h(footer_size)
-                            .flex_none()
-                            .justify_between()
-                            .child(
-                                self.render_generate_commit_message_button(cx)
-                                    .unwrap_or_else(|| div().into_any_element()),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .children(enable_coauthors)
-                                    .child(self.render_commit_button(cx)),
-                            ),
-                    )
-                    .child(
                         div()
+                            .min_h(min_height)
+                            .max_h(max_height)
                             .pr_2p5()
                             .on_action(|&zed_actions::editor::MoveUp, _, cx| {
                                 cx.stop_propagation();
@@ -4305,6 +4312,29 @@ impl GitPanel {
                                         }
                                     })),
                             ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .id("commit-footer")
+                    .border_t_1()
+                    .when(editor_is_long, |el| {
+                        el.border_color(cx.theme().colors().border_variant)
+                    })
+                    .w_full()
+                    .px_2()
+                    .h(footer_size)
+                    .flex_none()
+                    .justify_between()
+                    .child(
+                        self.render_generate_commit_message_button(cx)
+                            .unwrap_or_else(|| div().into_any_element()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .children(enable_coauthors)
+                            .child(self.render_commit_button(cx)),
                     ),
             );
 

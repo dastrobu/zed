@@ -890,6 +890,10 @@
     ///
     /// Default: false
     "tree_view": false,
+    // Minimum number of lines of height the commit editor should have.
+    //
+    // Default: 6
+    "commit_editor_min_lines": 6,
     "scrollbar": {
       // When to show the scrollbar in the git panel.
       //

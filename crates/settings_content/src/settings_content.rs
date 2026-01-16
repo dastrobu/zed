@@ -542,6 +542,9 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: false
     pub tree_view: Option<bool>,
+
+    /// Minimum number of lines of height the commit editor should have.
+    pub commit_editor_min_lines: Option<usize>,
 }
 
 #[derive(

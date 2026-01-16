@@ -25,6 +25,13 @@ pub struct GitPanelSettings {
     pub sort_by_path: bool,
     pub collapse_untracked_diff: bool,
     pub tree_view: bool,
+    pub commit_editor_min_lines: usize,
+}
+
+impl GitPanelSettings {
+    pub fn commit_editor_max_lines(&self) -> usize {
+        self.commit_editor_min_lines * 2
+    }
 }
 
 impl ScrollbarVisibility for GitPanelSettings {
@@ -58,6 +65,7 @@ impl Settings for GitPanelSettings {
             sort_by_path: git_panel.sort_by_path.unwrap(),
             collapse_untracked_diff: git_panel.collapse_untracked_diff.unwrap(),
             tree_view: git_panel.tree_view.unwrap(),
+            commit_editor_min_lines: git_panel.commit_editor_min_lines.unwrap().max(1),
         }
     }
 }
