@@ -184,6 +184,29 @@ fn main() {
 
     let args = Args::parse();
 
+    // Apply FD limit if specified (for testing)
+    #[cfg(unix)]
+    if let Some(fd_limit) = args.fd_limit {
+        eprintln!("Setting file descriptor limit to: {}", fd_limit);
+        unsafe {
+            let mut rlimit = libc::rlimit {
+                rlim_cur: fd_limit,
+                rlim_max: fd_limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rlimit) != 0 {
+                eprintln!("Warning: Failed to set FD limit to {}", fd_limit);
+            } else {
+                // Verify it was set
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlimit) == 0 {
+                    eprintln!(
+                        "FD limit set successfully: soft={}, hard={}",
+                        rlimit.rlim_cur, rlimit.rlim_max
+                    );
+                }
+            }
+        }
+    }
+
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
     if let Some(socket) = &args.askpass {
@@ -1527,6 +1550,10 @@ struct Args {
 
     #[arg(long, hide = true)]
     dump_all_actions: bool,
+
+    /// Set file descriptor limit for testing (test branch only)
+    #[arg(long, hide = true)]
+    fd_limit: Option<u64>,
 
     /// Output current environment variables as JSON to stdout
     #[arg(long, hide = true)]

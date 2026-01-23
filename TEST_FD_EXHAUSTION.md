@@ -11,7 +11,15 @@ git checkout fix/anthropic-tool-use-result-pairing-test
 # 2. Build the test server
 cargo build -p mcp_test_server
 
-# 3. Run the test script
+# 3. Build Zed
+cargo build --release
+
+# 4. Run Zed with limited FDs and the test MCP server configured
+cargo run --release -- --fd-limit 256
+```
+
+Or use the automated test script:
+```bash
 ./crates/mcp_test_server/test-fd-exhaustion.sh
 ```
 
@@ -71,23 +79,21 @@ Located in `crates/mcp_test_server/`, this server deliberately leaks file descri
 
 ## Manual Testing Steps
 
-### 1. Lower FD Limit
-
-```bash
-# Check current limit
-ulimit -n
-
-# Lower to 256 for testing
-ulimit -n 256
-```
-
-### 2. Build and Configure
+### 1. Build Test Server and Zed
 
 ```bash
 # Build the test server
 cargo build -p mcp_test_server
 
-# Add to Zed settings.json:
+# Build Zed
+cargo build --release
+```
+
+### 2. Configure Test Server
+
+Add to Zed settings.json:
+
+```bash
 {
   "language_models": {
     "mcp_servers": {
@@ -99,9 +105,20 @@ cargo build -p mcp_test_server
 }
 ```
 
-### 3. Run Zed
+### 3. Run Zed with FD Limit
+
+**New Method (Recommended):** Use the built-in `--fd-limit` flag:
 
 ```bash
+cargo run --release -- --fd-limit 256
+```
+
+This is safer than `ulimit` as it only affects the Zed process.
+
+**Old Method:** Use `ulimit` (affects entire shell session):
+
+```bash
+ulimit -n 256
 cargo run --release
 ```
 
@@ -183,15 +200,16 @@ tail -f ~/Library/Logs/Zed/Zed.log | grep -E "error|ERROR|400"
 ## Cleanup
 
 ```bash
-# Reset FD limit
+# If you used ulimit method, reset FD limit
 ulimit -n 10240
 
-# Kill test server (releases leaked FDs)
+# Kill any running test servers (releases leaked FDs)
 pkill mcp-fd-exhaustion-server
 
-# Remove from Zed settings.json
-# (Delete the fd-test-server configuration)
+# Remove fd-test-server from Zed settings.json
 ```
+
+**Note:** If you used `--fd-limit` flag, no cleanup needed - limit only affected that Zed process.
 
 ## Additional Resources
 
@@ -228,9 +246,10 @@ Tests verify:
 - Run manually to see errors: `./target/debug/mcp-fd-exhaustion-server`
 
 **Can't hit FD exhaustion:**
-- Lower limit more: `ulimit -n 128`
+- Lower limit more: `--fd-limit 128` or `ulimit -n 128`
 - Use `aggressive_leak` tool instead of others
 - Ask for more concurrent calls (50-100)
+- Verify the limit is actually set (check Zed startup logs)
 
 **Not seeing orphaned results:**
 - The bug requires actual DB save failure

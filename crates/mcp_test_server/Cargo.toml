@@ -12,10 +12,17 @@ workspace = true
 name = "mcp-fd-exhaustion-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "zed-with-fd-limit"
+path = "src/zed_with_fd_limit.rs"
+
 [dependencies]
 anyhow.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [package.metadata.cargo-machete]
 ignored = ["tracing"]

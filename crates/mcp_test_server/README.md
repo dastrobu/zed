@@ -89,22 +89,33 @@ Reports current FD leak statistics.
 
 ## Testing the Fix
 
-### Step 1: Lower FD Limit
-
-```bash
-# Check current limit
-ulimit -n
-
-# Lower to trigger exhaustion faster (256 is good for testing)
-ulimit -n 256
-```
-
-### Step 2: Build and Run Zed
+### Step 1: Build Zed and Test Server
 
 ```bash
 cd /path/to/zed
 git checkout fix/anthropic-tool-use-result-pairing-test
+
+# Build test server
+cargo build -p mcp_test_server
+
+# Build Zed
 cargo build --release
+```
+
+### Step 2: Run Zed with FD Limit
+
+**Recommended Method:** Use the built-in `--fd-limit` flag (test branch only):
+
+```bash
+cargo run --release -- --fd-limit 256
+```
+
+This is safer as it only affects the Zed process.
+
+**Alternative Method:** Use `ulimit` (affects entire shell session):
+
+```bash
+ulimit -n 256
 cargo run --release
 ```
 
@@ -178,7 +189,7 @@ Check for these indicators:
 ## Cleanup
 
 ```bash
-# Reset FD limit
+# If you used ulimit method, reset FD limit
 ulimit -n 10240
 
 # Kill the server (it holds FDs until process exits)
@@ -187,6 +198,8 @@ pkill mcp-fd-exhaustion-server
 # Clean up any leaked temp files
 rm -rf /tmp/mcp-test-*
 ```
+
+**Note:** If you used the `--fd-limit` flag, no FD limit cleanup is needed - it only affected that specific Zed process.
 
 ## Technical Details
 
