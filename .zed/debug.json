@@ -2,6 +2,7 @@
   {
     "label": "Debug Zed (CodeLLDB)",
     "adapter": "CodeLLDB",
+    "args": ["--fd-limit", "256"],
     "env": {
       "HOME": "/Users/Q453358/tmp/zed-home",
     },
@@ -14,6 +15,7 @@
   {
     "label": "Debug Zed (GDB)",
     "adapter": "GDB",
+    "args": ["--fd-limit", "256"],
     "build": {
       "label": "Build Zed",
       "command": "cargo",
