@@ -27,7 +27,7 @@ PR #47229 adds tracking of which `tool_use` IDs are included in requests and fil
 ## Building
 
 ```bash
-cargo build --bin mcp-fd-exhaustion-server
+cargo build -p mcp_test_server
 ```
 
 ## Running

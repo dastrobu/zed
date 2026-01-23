@@ -2,11 +2,14 @@
   {
     "label": "Debug Zed (CodeLLDB)",
     "adapter": "CodeLLDB",
+    "env": {
+      "HOME": "/Users/Q453358/tmp/zed-home",
+    },
     "build": {
       "label": "Build Zed",
       "command": "cargo",
-      "args": ["build"]
-    }
+      "args": ["build"],
+    },
   },
   {
     "label": "Debug Zed (GDB)",
@@ -14,7 +17,7 @@
     "build": {
       "label": "Build Zed",
       "command": "cargo",
-      "args": ["build"]
-    }
-  }
+      "args": ["build"],
+    },
+  },
 ]

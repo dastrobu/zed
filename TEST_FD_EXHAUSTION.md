@@ -9,7 +9,7 @@ This document explains how to test the fix for orphaned `tool_result` blocks cau
 git checkout fix/anthropic-tool-use-result-pairing-test
 
 # 2. Build the test server
-cargo build --bin mcp-fd-exhaustion-server
+cargo build -p mcp_test_server
 
 # 3. Run the test script
 ./crates/mcp_test_server/test-fd-exhaustion.sh
@@ -85,7 +85,7 @@ ulimit -n 256
 
 ```bash
 # Build the test server
-cargo build --bin mcp-fd-exhaustion-server
+cargo build -p mcp_test_server
 
 # Add to Zed settings.json:
 {

@@ -60,7 +60,7 @@ fi
 
 # Build the test server
 print_header "Building MCP FD Exhaustion Test Server"
-if cargo build --bin mcp-fd-exhaustion-server; then
+if cargo build -p mcp_test_server; then
     print_success "Test server built successfully"
 else
     print_error "Failed to build test server"

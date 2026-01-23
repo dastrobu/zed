@@ -536,7 +536,7 @@ impl AgentMessage {
             // Only include tool_results that have a corresponding tool_use in the assistant message.
             // This prevents orphaned tool_result blocks that would cause API errors.
             if !included_tool_use_ids.contains(&tool_result.tool_use_id) {
-                log::debug!(
+                log::warn!(
                     "Skipping orphaned tool_result with ID {} (no corresponding tool_use in assistant message)",
                     tool_result.tool_use_id
                 );
