@@ -1,0 +1,21 @@
+[package]
+name = "mcp_test_server"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mcp-fd-exhaustion-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["tracing"]

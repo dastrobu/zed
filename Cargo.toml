@@ -116,6 +116,7 @@ members = [
     "crates/migrator",
     "crates/mistral",
     "crates/miniprofiler_ui",
+    "crates/mcp_test_server",
     "crates/multi_buffer",
     "crates/nc",
     "crates/net",
