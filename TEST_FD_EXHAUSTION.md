@@ -8,41 +8,100 @@ This document explains how to test the fix for orphaned `tool_result` blocks cau
 # 1. Checkout the test branch
 git checkout fix/anthropic-tool-use-result-pairing-test
 
-# 2. Build the test server
+# 2. Build everything
 cargo build -p mcp_test_server
-
-# 3. Build Zed
 cargo build --release
 
-# 4. Run Zed with limited FDs and the test MCP server configured
-cargo run --release -- --fd-limit 256
-```
+# 3. Configure test MCP server in settings.json (see below)
 
-Or use the automated test script:
-```bash
-./crates/mcp_test_server/test-fd-exhaustion.sh
+# 4. Run Zed with FD limit
+cargo run --release -- --fd-limit 256
+
+# 5. Test in Agent Panel
+"Please call the aggressive_leak tool 50 times"
+
+# 6. Verify the fix
+tail -f ~/Library/Logs/Zed/Zed.log | grep orphaned
 ```
 
 ## What This Tests
 
-**The Bug:** When file descriptor exhaustion occurs during concurrent tool execution, Zed's thread state can become corrupted. This results in `tool_result` blocks being sent to the LLM API without their corresponding `tool_use` blocks, causing HTTP 400 errors and breaking the agent.
+**The Bug:** When file descriptor exhaustion occurs during concurrent tool execution, Zed's thread state can become corrupted in the database. This results in `tool_result` blocks being sent to the LLM API without their corresponding `tool_use` blocks, causing HTTP 400 errors and breaking the agent.
 
-**The Fix:** PR #47229 adds tracking to ensure only matched `tool_use`/`tool_result` pairs are sent to the API. Orphaned results are filtered out and logged as warnings.
+**The Fix:** PR #47229 adds defensive tracking to ensure only matched `tool_use`/`tool_result` pairs are sent to the API. Orphaned results are filtered out and logged as warnings instead of causing API failures.
 
-## Background
+## Background: Why File Descriptor Exhaustion Triggers API Errors
 
-### How FD Exhaustion Causes the Bug
+### The Complete Chain of Events
 
-1. LLM requests multiple concurrent tool uses
-2. Each `ToolUse` is added to `message.content` array
-3. Tools start executing - each opens files, sockets, DB connections
-4. Some tools complete and add results to `message.tool_results`
-5. **"Too many open files" OS error occurs**
-6. Zed auto-saves the thread (happens on every update)
-7. **SQLite cannot open database file/journal** due to FD exhaustion
-8. **Save operation fails or corrupts**
-9. On reload: **Mismatch between `content` and `tool_results`**
-10. Next API request has orphaned tool_results → HTTP 400 error
+1. **LLM requests multiple concurrent tool uses** (e.g., "search these 10 files")
+   - Each `ToolUse` is immediately added to `message.content` array when streamed from the LLM
+   - Tool execution Tasks are spawned to run concurrently
+
+2. **Tools start executing** - each opens file descriptors:
+   - MCP server connections (sockets)
+   - File operations in the tools
+   - Database connections for state tracking
+   - IPC mechanisms
+
+3. **Some tools complete successfully**
+   - Their results are added to `message.tool_results` HashMap
+   - Zed triggers an auto-save observer (happens on every thread update)
+
+4. **"Too many open files" OS error occurs** (EMFILE/ENFILE)
+   - Remaining tool executions fail to open files
+   - More critically: **SQLite cannot open the database file or journal file**
+
+5. **Thread auto-save attempts to persist state**
+   - Located in `crates/agent/src/db.rs` (`save_thread_sync`)
+   - Serializes the entire thread as a single JSON blob
+   - Calls SQLite to write to `threads.db`
+
+6. **Database write fails or partially succeeds**
+   - SQLite needs to open both the DB file and a journal file
+   - Without available file descriptors, the write operation fails
+   - This can result in:
+     - Complete write failure (thread state not saved)
+     - Partial write (JSON corrupted or incomplete)
+     - Stale state persisted (outdated content/tool_results mapping)
+
+7. **State corruption occurs**
+   - The in-memory `message.content` array may have different `ToolUse` entries than what got saved
+   - The in-memory `message.tool_results` HashMap may have different results than what got saved
+   - On the next save attempt or on reload: mismatch between the two
+
+8. **Thread gets reloaded from database** (on app restart or thread restore)
+   - Located in `crates/agent/src/db.rs` (`DbThread::from_json`)
+   - Loads both `content` array and `tool_results` HashMap from the JSON blob
+   - Due to corruption: some `tool_result` entries have no corresponding `ToolUse` in `content`
+
+9. **Next LLM turn builds request** (`AgentMessage::to_request()`)
+   - Iterates through `content` to build assistant message
+   - **Key logic:** Only includes `ToolUse` if it has a result (line 518):
+     ```rust
+     if self.tool_results.contains_key(&tool_use.id) {
+         assistant_message.content.push(tool_use);
+         included_tool_use_ids.insert(tool_use.id);
+     }
+     ```
+   - Then includes ALL `tool_result` entries from `tool_results` HashMap
+   - **Problem:** If a `tool_result` exists but its `ToolUse` wasn't in `content`, it becomes orphaned
+
+10. **API rejects the malformed request**
+    - LLM providers (Anthropic, OpenAI, etc.) require that every `tool_result` in a user message has a corresponding `tool_use` in the previous assistant message
+    - Returns HTTP 400 error: "tool_result without corresponding tool_use"
+    - Agent panel breaks and cannot continue the conversation
+
+### Why This Is a Real-World Issue
+
+This isn't a theoretical bug - it happens in production when:
+- Users run many concurrent agent operations
+- System is under memory/resource pressure
+- MCP servers open many files (file search, code analysis, etc.)
+- Long-running agent sessions accumulate open file descriptors
+- Background processes consume available FDs
+
+The corruption persists across Zed restarts because it's stored in the SQLite database.
 
 ### The Fix Logic
 
@@ -107,20 +166,19 @@ Add to Zed settings.json:
 
 ### 3. Run Zed with FD Limit
 
-**New Method (Recommended):** Use the built-in `--fd-limit` flag:
+Use the built-in `--fd-limit` flag (test branch only):
 
 ```bash
 cargo run --release -- --fd-limit 256
 ```
 
-This is safer than `ulimit` as it only affects the Zed process.
+**Why this is better than `ulimit`:**
+- ✅ Only affects the Zed process (not your entire shell)
+- ✅ Cross-platform (macOS and Linux)
+- ✅ No cleanup required (limit dies with the process)
+- ✅ Safer for your development environment
 
-**Old Method:** Use `ulimit` (affects entire shell session):
-
-```bash
-ulimit -n 256
-cargo run --release
-```
+**Alternative:** Press **F5** in Zed to debug - the debug configuration already has `--fd-limit 256` set.
 
 ### 4. Trigger FD Exhaustion
 
@@ -200,16 +258,13 @@ tail -f ~/Library/Logs/Zed/Zed.log | grep -E "error|ERROR|400"
 ## Cleanup
 
 ```bash
-# If you used ulimit method, reset FD limit
-ulimit -n 10240
-
 # Kill any running test servers (releases leaked FDs)
 pkill mcp-fd-exhaustion-server
 
 # Remove fd-test-server from Zed settings.json
 ```
 
-**Note:** If you used `--fd-limit` flag, no cleanup needed - limit only affected that Zed process.
+**Note:** No FD limit cleanup needed! The `--fd-limit` flag only affects the Zed process, and the limit disappears when Zed exits.
 
 ## Additional Resources
 
@@ -246,10 +301,14 @@ Tests verify:
 - Run manually to see errors: `./target/debug/mcp-fd-exhaustion-server`
 
 **Can't hit FD exhaustion:**
-- Lower limit more: `--fd-limit 128` or `ulimit -n 128`
+- Lower limit more: `--fd-limit 128`
 - Use `aggressive_leak` tool instead of others
 - Ask for more concurrent calls (50-100)
-- Verify the limit is actually set (check Zed startup logs)
+- Verify the limit is set correctly by checking Zed's startup output:
+  ```
+  Setting file descriptor limit to: 256
+  FD limit set successfully: soft=256, hard=256
+  ```
 
 **Not seeing orphaned results:**
 - The bug requires actual DB save failure
