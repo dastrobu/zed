@@ -72,16 +72,13 @@ print_info "Server path: $SERVER_PATH"
 
 # Test the server works
 print_header "Testing Server Functionality"
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | "$SERVER_PATH" > /tmp/mcp-test-output.json 2>/dev/null &
-SERVER_PID=$!
-sleep 1
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | "$SERVER_PATH" > /tmp/mcp-test-output.json 2>&1
 
-if kill -0 $SERVER_PID 2>/dev/null; then
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
+if [ -s /tmp/mcp-test-output.json ] && grep -q "mcp-fd-exhaustion-test-server" /tmp/mcp-test-output.json; then
     print_success "Server responds correctly"
 else
-    print_error "Server failed to start"
+    print_error "Server failed to respond properly"
+    cat /tmp/mcp-test-output.json
     exit 1
 fi
 
@@ -162,32 +159,20 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     NEW_LIMIT=$(ulimit -n)
     print_success "FD limit now: $NEW_LIMIT"
 
-    # Start the server in background
-    print_info "Starting test server..."
-    "$SERVER_PATH" > /tmp/mcp-test.log 2>&1 &
-    SERVER_PID=$!
-    sleep 1
-
-    # Send test requests
+    # Send test requests via stdin
     print_info "Sending test requests to leak FDs..."
-    for i in {1..30}; do
-        echo '{"jsonrpc":"2.0","id":'$i',"method":"tools/call","params":{"name":"aggressive_leak","arguments":{}}}' | \
-            nc localhost 9999 2>/dev/null || echo "Request $i" >&2
-        sleep 0.1
-    done
+    {
+        for i in {1..30}; do
+            echo '{"jsonrpc":"2.0","id":'$i',"method":"tools/call","params":{"name":"aggressive_leak","arguments":{}}}'
+        done
+        echo '{"jsonrpc":"2.0","id":999,"method":"tools/call","params":{"name":"status","arguments":{}}}'
+    } | "$SERVER_PATH" > /tmp/mcp-test.log 2>&1
 
-    # Check status
-    echo '{"jsonrpc":"2.0","id":999,"method":"tools/call","params":{"name":"status","arguments":{}}}' | \
-        nc localhost 9999 2>/dev/null || echo "Status request" >&2
+    print_success "Test requests completed"
 
-    # Kill server
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-
-    # Restore FD limit
-    print_info "Restoring original FD limit..."
-    ulimit -n $ORIGINAL_LIMIT
-    print_success "FD limit restored to: $(ulimit -n)"
+    # Note: Can't restore FD limit in script (can only lower, not raise)
+    print_warning "Note: FD limit remains at 256 in this script session"
+    print_info "To restore manually: ulimit -n $ORIGINAL_LIMIT (in your shell)"
 
     print_success "Automated test completed"
     print_info "Check /tmp/mcp-test.log for server output"
@@ -197,9 +182,9 @@ fi
 print_header "Cleanup"
 echo
 print_info "When done testing:"
-echo "  • Reset FD limit: ulimit -n $ORIGINAL_LIMIT"
-echo "  • Kill server: pkill mcp-fd-exhaustion-server"
-echo "  • Remove from Zed settings.json"
+echo "  • If you ran automated test, reset FD limit: ulimit -n $ORIGINAL_LIMIT"
+echo "  • Kill any running servers: pkill mcp-fd-exhaustion-server"
+echo "  • Remove fd-test-server from Zed settings.json"
 echo
 
 print_header "Test Setup Complete"
