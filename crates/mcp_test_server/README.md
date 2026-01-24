@@ -87,6 +87,43 @@ The main test tool. Leaks 5 FDs on every call, plus 50 additional FDs on every 1
 ### `status`
 Reports current FD leak statistics.
 
+### `large_response`
+Returns a very large response (default 100 KB) to force Zed to use file descriptors for buffering and processing.
+
+**Input:**
+```json
+{
+  "size_kb": 100  // Size in KB
+}
+```
+
+**Note:** This tool affects the **MCP server's** FD usage. To exhaust **Zed's** FDs, you need to trigger many concurrent tool calls or use tools that cause Zed to open files.
+
+## Important: How FD Quotas Work
+
+**Critical Understanding:** Each process has its **own** file descriptor count up to the limit:
+
+- When you set `--fd-limit 256` on Zed, it applies to the Zed process
+- Child processes (like MCP servers) **inherit the same limit** but have **separate FD counts**
+- An MCP server leaking 200 FDs exhausts **its own quota**, not Zed's quota
+- Parent and child processes **do not share** a common FD pool
+
+**What This Means:**
+The MCP server's `leak_fd` tools exhaust the **MCP server process**, not Zed directly.
+
+**How the Test Still Works:**
+1. With `--fd-limit 256`, Zed has limited headroom
+2. Zed opens many FDs during operation: project files, LSP servers, logs, MCP connections
+3. When Zed spawns multiple MCP servers + tries to save to SQLite, **Zed itself runs out**
+4. SQLite cannot open database file/journal → save fails/corrupts
+5. This creates the orphaned tool_result scenario
+
+**The Real Trigger:** Zed exhausting its own quota when handling:
+- Multiple concurrent MCP server connections (each uses sockets/pipes)
+- SQLite database writes (needs DB file + journal file)
+- Project files, LSP servers, file watchers
+- Log files and IPC mechanisms
+
 ## Testing the Fix
 
 ### Step 1: Build Zed and Test Server
@@ -104,20 +141,21 @@ cargo build --release
 
 ### Step 2: Run Zed with FD Limit
 
-**Recommended Method:** Use the built-in `--fd-limit` flag (test branch only):
+Use the built-in `--fd-limit` flag (test branch only):
 
 ```bash
 cargo run --release -- --fd-limit 256
 ```
 
-This is safer as it only affects the Zed process.
-
-**Alternative Method:** Use `ulimit` (affects entire shell session):
-
-```bash
-ulimit -n 256
-cargo run --release
+**On startup, you'll see:**
 ```
+Setting file descriptor limit to: 256
+FD limit set successfully: soft=256, hard=256
+Current FD usage: 12 open, 244 remaining (of 256)
+Note: Child processes (like MCP servers) have their own separate FD quota of 256
+```
+
+This shows you the current FD usage and helps you monitor when exhaustion might occur.
 
 ### Step 3: Configure the Test Server
 
@@ -125,17 +163,24 @@ Add the server to your Zed settings as shown above.
 
 ### Step 4: Trigger FD Exhaustion
 
-In the Zed Agent Panel, use prompts like:
+In the Zed Agent Panel, use prompts that trigger **many concurrent tool calls**:
 
 ```
-Please call the aggressive_leak tool 50 times
+Please call the aggressive_leak tool 100 times
 ```
 
-Or more naturally:
+Or use multiple tools concurrently to force Zed to open many MCP connections:
 
 ```
-Please use the aggressive_leak tool repeatedly to test file descriptor handling
+Use the aggressive_leak tool 50 times while also calling the large_response tool 20 times
 ```
+
+**Why concurrent matters:** When Zed handles multiple MCP tool calls simultaneously, it needs to:
+- Maintain connections to the MCP server (sockets/pipes) for each call
+- Buffer responses from multiple tools
+- Keep SQLite database open for auto-save
+- Handle project files and LSP servers
+- This combination exhausts Zed's own FD quota, not just the MCP server's
 
 ### Step 5: Monitor Logs
 
@@ -199,7 +244,22 @@ pkill mcp-fd-exhaustion-server
 rm -rf /tmp/mcp-test-*
 ```
 
-**Note:** If you used the `--fd-limit` flag, no FD limit cleanup is needed - it only affected that specific Zed process.
+**Note:** The `--fd-limit` flag only affects the Zed process. No cleanup needed - the limit disappears when Zed exits.
+
+### Understanding the Test Results
+
+**FD Usage Breakdown:**
+- **Zed process:** Opens files, DB, LSP connections, MCP pipes → counts toward Zed's 256 limit
+- **MCP server process:** Opens files independently → has its own separate 256 limit
+- **Test success:** When Zed's quota is exhausted (not the MCP server's), thread save fails
+
+**Why the test works:**
+Even though the MCP server has its own quota, triggering many concurrent tool calls forces Zed to:
+1. Create many pipe/socket connections to the MCP server
+2. Buffer responses from multiple calls
+3. Attempt to save thread state to SQLite
+4. All while maintaining project files, LSP connections, etc.
+This pushes Zed to its 256 FD limit, causing the save failure that creates orphaned results.
 
 ## Technical Details
 

@@ -202,6 +202,20 @@ fn main() {
                         "FD limit set successfully: soft={}, hard={}",
                         rlimit.rlim_cur, rlimit.rlim_max
                     );
+
+                    // Log current FD usage
+                    let current_fds = std::fs::read_dir("/dev/fd")
+                        .map(|entries| entries.count())
+                        .unwrap_or(0);
+                    let remaining = rlimit.rlim_cur.saturating_sub(current_fds as u64);
+                    eprintln!(
+                        "Current FD usage: {} open, {} remaining (of {})",
+                        current_fds, remaining, rlimit.rlim_cur
+                    );
+                    eprintln!(
+                        "Note: Child processes (like MCP servers) have their own separate FD quota of {}",
+                        rlimit.rlim_cur
+                    );
                 }
             }
         }

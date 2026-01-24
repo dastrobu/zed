@@ -160,6 +160,20 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                         "type": "object",
                         "properties": {}
                     }
+                },
+                {
+                    "name": "large_response",
+                    "description": "Returns a very large response to force Zed to use file descriptors for buffering",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "size_kb": {
+                                "type": "number",
+                                "description": "Size of response in KB (default: 100)",
+                                "default": 100
+                            }
+                        }
+                    }
                 }
             ]
         })),
@@ -272,6 +286,35 @@ fn handle_tool_call(
                 error: None,
             }
         }
+        "large_response" => {
+            let size_kb = arguments
+                .get("size_kb")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as usize;
+
+            // Create a large string that forces Zed to buffer it
+            // This can cause Zed to open temp files or use more FDs
+            let chunk = "A".repeat(1024); // 1 KB
+            let mut large_text = String::with_capacity(size_kb * 1024);
+            for i in 0..size_kb {
+                large_text.push_str(&format!("Chunk {}/{}: {}\n", i + 1, size_kb, chunk));
+            }
+
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "Large response test: {} KB of data follows:\n\n{}",
+                            size_kb, large_text
+                        )
+                    }]
+                })),
+                error: None,
+            }
+        }
         _ => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id,
@@ -320,6 +363,12 @@ fn handle_request(request: JsonRpcRequest, state: &ServerState) -> JsonRpcRespon
 fn main() -> Result<()> {
     eprintln!("MCP FD Exhaustion Test Server starting");
     eprintln!("This server deliberately leaks file descriptors to test PR #47229");
+    eprintln!();
+    eprintln!("IMPORTANT: Each process has its own FD quota!");
+    eprintln!("- This server's leaked FDs exhaust ITS quota (separate from Zed)");
+    eprintln!("- For Zed to exhaust its quota, use large_response tool");
+    eprintln!("- Or trigger many concurrent tool calls (forces Zed to spawn many connections)");
+    eprintln!();
 
     let state = ServerState::new();
 

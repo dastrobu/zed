@@ -30,6 +30,29 @@ tail -f ~/Library/Logs/Zed/Zed.log | grep orphaned
 
 **The Fix:** PR #47229 adds defensive tracking to ensure only matched `tool_use`/`tool_result` pairs are sent to the API. Orphaned results are filtered out and logged as warnings instead of causing API failures.
 
+## Important: How FD Quotas Work
+
+**Key Understanding:** Each process has its **own** file descriptor count up to the limit:
+- When you set `--fd-limit 256` on Zed, it applies to the Zed process
+- Child processes (like MCP servers) inherit the same limit but have **separate FD counts**
+- MCP server leaking FDs exhausts **its own** quota, not Zed's quota
+
+**What This Means for Testing:**
+- The MCP server's leaked FDs don't directly exhaust Zed's FD pool
+- However, the test still works because:
+  1. Zed opens many files during normal operation (project files, DB, logs, sockets)
+  2. With `--fd-limit 256`, Zed has very few FDs available
+  3. When Zed tries to spawn multiple MCP server processes + open DB files for saving, **Zed itself runs out**
+  4. The MCP server tools failing due to their own FD exhaustion also creates error conditions
+  5. Both contribute to the stress scenario that can corrupt thread state
+
+**The Real Trigger:** Zed exhausting its own FDs when trying to:
+- Open SQLite database file for thread save
+- Open SQLite journal file
+- Create IPC connections
+- Handle concurrent MCP server connections
+- Open project files during tool execution
+
 ## Background: Why File Descriptor Exhaustion Triggers API Errors
 
 ### The Complete Chain of Events
@@ -44,13 +67,33 @@ tail -f ~/Library/Logs/Zed/Zed.log | grep orphaned
    - Database connections for state tracking
    - IPC mechanisms
 
-3. **Some tools complete successfully**
+4. **Some tools complete successfully**
    - Their results are added to `message.tool_results` HashMap
    - Zed triggers an auto-save observer (happens on every thread update)
 
-4. **"Too many open files" OS error occurs** (EMFILE/ENFILE)
+5. **"Too many open files" OS error occurs** (EMFILE/ENFILE)
+   - With `--fd-limit 256` active, Zed quickly approaches its limit from:
+     - Open project files and buffers
+     - Multiple MCP server child process connections
+     - IPC sockets and pipes
+     - Log files and temporary files
+     - LSP server connections
    - Remaining tool executions fail to open files
-   - More critically: **SQLite cannot open the database file or journal file**
+   - More critically: **Zed itself cannot open the SQLite database file or journal file** for saving
+</text>
+</function_calls>
+
+<old_text line=68>
+### Why This Is a Real-World Issue
+
+This isn't a theoretical bug - it happens in production when:
+- Users run many concurrent agent operations
+- System is under memory/resource pressure
+- MCP servers open many files (file search, code analysis, etc.)
+- Long-running agent sessions accumulate open file descriptors
+- Background processes consume available FDs
+
+The corruption persists across Zed restarts because it's stored in the SQLite database.
 
 5. **Thread auto-save attempts to persist state**
    - Located in `crates/agent/src/db.rs` (`save_thread_sync`)
@@ -172,13 +215,27 @@ Use the built-in `--fd-limit` flag (test branch only):
 cargo run --release -- --fd-limit 256
 ```
 
-**Why this is better than `ulimit`:**
-- ✅ Only affects the Zed process (not your entire shell)
+**On startup, you'll see:**
+```
+Setting file descriptor limit to: 256
+FD limit set successfully: soft=256, hard=256
+Current FD usage: 12 open, 244 remaining (of 256)
+Note: Child processes (like MCP servers) have their own separate FD quota of 256
+```
+
+**Why this is better:**
+- ✅ Only affects the Zed process (child processes inherit the limit but have separate quotas)
 - ✅ Cross-platform (macOS and Linux)
 - ✅ No cleanup required (limit dies with the process)
 - ✅ Safer for your development environment
+- ✅ Shows FD usage logging so you can monitor exhaustion
 
 **Alternative:** Press **F5** in Zed to debug - the debug configuration already has `--fd-limit 256` set.
+
+**Important:** The limit of 256 means:
+- Zed can open up to 256 FDs
+- Each child MCP server can also open up to 256 FDs (separate quota)
+- The test works because Zed itself exhausts its own quota when spawning multiple servers + opening DB files
 
 ### 4. Trigger FD Exhaustion
 
@@ -200,12 +257,21 @@ Use the aggressive_leak tool repeatedly to test file descriptor handling
 # Terminal 1: Watch for the fix working
 tail -f ~/Library/Logs/Zed/Zed.log | grep orphaned
 
-# Terminal 2: Monitor FD usage
+# Terminal 2: Monitor Zed's FD usage (not MCP server's)
 watch -n 1 "lsof -p \$(pgrep Zed) | wc -l"
 
 # Terminal 3: Check for errors
-tail -f ~/Library/Logs/Zed/Zed.log | grep -E "error|ERROR|400"
+tail -f ~/Library/Logs/Zed/Zed.log | grep -E "error|ERROR|400|EMFILE"
+
+# Terminal 4: Monitor ALL child processes
+watch -n 1 "pgrep -P \$(pgrep Zed) | xargs -I {} sh -c 'echo \"PID {}: \$(lsof -p {} 2>/dev/null | wc -l) FDs\"'"
 ```
+
+**What to look for:**
+- Zed's own FD count approaching 256
+- "EMFILE" or "Too many open files" errors in logs
+- Multiple MCP server child processes spawned
+- Zed startup logs showing FD usage and remaining count
 
 ## Expected Results
 
@@ -301,14 +367,17 @@ Tests verify:
 - Run manually to see errors: `./target/debug/mcp-fd-exhaustion-server`
 
 **Can't hit FD exhaustion:**
-- Lower limit more: `--fd-limit 128`
+- Lower limit more: `--fd-limit 128` (less headroom for Zed)
 - Use `aggressive_leak` tool instead of others
-- Ask for more concurrent calls (50-100)
+- Ask for more concurrent calls (100+) to force Zed to spawn many MCP connections
+- Open a large project in Zed first (uses more FDs for LSP, file watching, etc.)
 - Verify the limit is set correctly by checking Zed's startup output:
   ```
   Setting file descriptor limit to: 256
   FD limit set successfully: soft=256, hard=256
+  Current FD usage: 12 open, 244 remaining (of 256)
   ```
+- Remember: Child MCP servers have separate quotas, so you need Zed itself to exhaust its quota
 
 **Not seeing orphaned results:**
 - The bug requires actual DB save failure
