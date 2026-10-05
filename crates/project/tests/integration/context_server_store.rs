@@ -1,8 +1,13 @@
 use anyhow::Result;
+use context_server::oauth::{
+    OAuthClientRegistration, OAuthSession, OAuthTokens, canonical_server_uri,
+};
 use context_server::test::create_fake_transport;
 use context_server::{ContextServer, ContextServerId};
+use credentials_provider::CredentialsProvider;
 use gpui::{AppContext, AsyncApp, Entity, Subscription, Task, TestAppContext, UpdateGlobal as _};
 use http_client::{FakeHttpClient, Response};
+use parking_lot::Mutex;
 use project::context_server_store::registry::ContextServerDescriptorRegistry;
 use project::context_server_store::*;
 use project::project_settings::ContextServerSettings;
@@ -15,7 +20,7 @@ use serde_json::json;
 use settings::settings_content::SaturatingBool;
 use settings::{ContextServerCommand, Settings, SettingsStore};
 use std::sync::Arc;
-use std::{cell::RefCell, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, future::Future, path::PathBuf, pin::Pin, rc::Rc};
 use util::path;
 
 #[gpui::test]
@@ -977,6 +982,220 @@ async fn test_remote_context_server(cx: &mut TestAppContext) {
         cx,
     );
     cx.run_until_parked();
+}
+
+struct TestOAuthCredentialsProvider {
+    credentials: Mutex<HashMap<String, (String, Vec<u8>)>>,
+    reads: Mutex<usize>,
+}
+
+impl CredentialsProvider for TestOAuthCredentialsProvider {
+    fn read_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+        Box::pin(async move {
+            *self.reads.lock() += 1;
+            Ok(self.credentials.lock().get(url).cloned())
+        })
+    }
+
+    fn write_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        username: &'a str,
+        password: &'a [u8],
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            self.credentials
+                .lock()
+                .insert(url.to_owned(), (username.to_owned(), password.to_vec()));
+            Ok(())
+        })
+    }
+
+    fn delete_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            self.credentials.lock().remove(url);
+            Ok(())
+        })
+    }
+}
+
+#[gpui::test]
+async fn test_global_http_server_in_two_projects_shares_rotated_oauth_session(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let server_id = ContextServerId("unity-int".into());
+    let server_url = url::Url::parse("https://mcp.example.com/mcp").unwrap();
+    let key = format!("mcp-oauth:{}", canonical_server_uri(&server_url));
+    let saved_session = OAuthSession {
+        token_endpoint: url::Url::parse("https://auth.example.com/token").unwrap(),
+        resource: url::Url::parse("https://mcp.example.com").unwrap(),
+        client_registration: OAuthClientRegistration {
+            client_id: "test-client".into(),
+            client_secret: None,
+        },
+        tokens: OAuthTokens {
+            access_token: "access-0".into(),
+            refresh_token: Some("refresh-0".into()),
+            expires_at: None,
+        },
+    };
+    let credentials_provider = Arc::new(TestOAuthCredentialsProvider {
+        credentials: Mutex::new(HashMap::from([(
+            key.clone(),
+            (
+                "mcp-oauth".into(),
+                serde_json::to_vec(&saved_session).unwrap(),
+            ),
+        )])),
+        reads: Mutex::new(0),
+    });
+
+    let reject_initial_access_token = Arc::new(AtomicBool::new(false));
+    let refresh_attempts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let valid_refresh_token = Arc::new(Mutex::new("refresh-0".to_owned()));
+    let client = FakeHttpClient::create({
+        let reject_initial_access_token = reject_initial_access_token.clone();
+        let refresh_attempts = refresh_attempts.clone();
+        move |request| {
+            let reject_initial_access_token = reject_initial_access_token.clone();
+            let refresh_attempts = refresh_attempts.clone();
+            let valid_refresh_token = valid_refresh_token.clone();
+            async move {
+                let uri = request.uri().to_string();
+                let authorization = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let mut body = request.into_body();
+                let mut message = String::new();
+                futures::AsyncReadExt::read_to_string(&mut body, &mut message).await?;
+
+                if uri == "https://auth.example.com/token" {
+                    let refresh_token = url::form_urlencoded::parse(message.as_bytes())
+                        .find(|(key, _)| key == "refresh_token")
+                        .map(|(_, value)| value.into_owned())
+                        .ok_or_else(|| anyhow::anyhow!("refresh request missing token"))?;
+                    refresh_attempts.lock().push(refresh_token.clone());
+                    let mut valid_refresh_token = valid_refresh_token.lock();
+                    if refresh_token != *valid_refresh_token {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .header("Content-Type", "application/json")
+                            .body(http_client::AsyncBody::from(r#"{"error":"invalid_grant"}"#))?);
+                    }
+                    *valid_refresh_token = "refresh-1".into();
+                    return Ok(json_response(json!({
+                        "access_token": "access-1",
+                        "refresh_token": "refresh-1",
+                        "expires_in": 3600
+                    })));
+                }
+                if uri != "https://mcp.example.com/mcp" {
+                    return Err(anyhow::anyhow!("unexpected HTTP endpoint: {uri}"));
+                }
+                if !matches!(
+                    authorization.as_deref(),
+                    Some("Bearer access-0" | "Bearer access-1")
+                ) || (reject_initial_access_token.load(Ordering::SeqCst)
+                    && authorization.as_deref() == Some("Bearer access-0"))
+                {
+                    return Ok(unauthorized_response());
+                }
+                let message: serde_json::Value = serde_json::from_str(&message)?;
+                match message.get("method").and_then(serde_json::Value::as_str) {
+                    Some("initialize") => Ok(json_response(json!({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                        }
+                    }))),
+                    Some("tools/list") => Ok(json_response(json!({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": { "tools": [] }
+                    }))),
+                    Some("notifications/initialized") => Ok(notification_accepted_response()),
+                    _ => Err(anyhow::anyhow!("unexpected MCP request: {message}")),
+                }
+            }
+        }
+    });
+    cx.update(|cx| cx.set_http_client(client));
+
+    let (fs, first_project) = setup_context_server_test(cx, json!({ "code.rs": "" }), vec![]).await;
+    fs.insert_tree(path!("/second"), json!({ "code.rs": "" }))
+        .await;
+    let second_project = Project::test(fs, [path!("/second").as_ref()], cx).await;
+    let first_store = first_project.read_with(cx, |project, _| project.context_server_store());
+    let second_store = second_project.read_with(cx, |project, _| project.context_server_store());
+    cx.update(|cx| {
+        cx.set_global(zed_credentials_provider::ZedCredentialsProvider(
+            credentials_provider.clone(),
+        ));
+    });
+
+    // One user setting is inherited by both projects, even without restoring a session.
+    set_http_context_server_configuration(&server_id, cx);
+    cx.run_until_parked();
+    for store in [&first_store, &second_store] {
+        assert_eq!(
+            store.read_with(cx, |store, _| store.status_for_server(&server_id)),
+            Some(ContextServerStatus::Running)
+        );
+    }
+    assert_eq!(*credentials_provider.reads.lock(), 2);
+    assert!(refresh_attempts.lock().is_empty());
+
+    // Both transports have already loaded refresh-0; stagger requests so the
+    // second fails even after the first has persisted refresh-1.
+    reject_initial_access_token.store(true, Ordering::SeqCst);
+    let first_client = first_store.read_with(cx, |store, _| {
+        store
+            .get_running_server(&server_id)
+            .unwrap()
+            .client()
+            .unwrap()
+    });
+    first_client
+        .request::<context_server::types::requests::ListTools>(())
+        .await
+        .expect("first project should refresh successfully");
+    cx.run_until_parked();
+    let persisted: OAuthSession =
+        serde_json::from_slice(&credentials_provider.credentials.lock().get(&key).unwrap().1)
+            .unwrap();
+    assert_eq!(persisted.tokens.refresh_token.as_deref(), Some("refresh-1"));
+    assert_eq!(refresh_attempts.lock().as_slice(), ["refresh-0"]);
+
+    let second_client = second_store.read_with(cx, |store, _| {
+        store
+            .get_running_server(&server_id)
+            .unwrap()
+            .client()
+            .unwrap()
+    });
+    let second_result = second_client
+        .request::<context_server::types::requests::ListTools>(())
+        .await;
+    assert!(
+        second_result.is_ok(),
+        "second project should reuse the rotated session instead of requiring reauthentication: {second_result:?}"
+    );
 }
 
 // A server may accept `initialize` unauthenticated (returns 200) yet only send
