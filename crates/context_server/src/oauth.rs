@@ -2893,4 +2893,103 @@ mod tests {
             assert_eq!(provider.access_token().as_deref(), Some("old-access"));
         });
     }
+
+    #[test]
+    #[ignore = "independent providers can reuse one rotating refresh token"]
+    fn test_mcp_oauth_providers_coalesce_concurrent_refreshes() {
+        use futures::channel::oneshot;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+
+        gpui::block_on(async {
+            let (release_first_request, first_request_released) = oneshot::channel::<()>();
+            let first_request_released = Arc::new(SyncMutex::new(Some(first_request_released)));
+            let valid_refresh_token = Arc::new(SyncMutex::new("refresh-0".to_string()));
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let http_client = make_fake_http_client({
+                let first_request_released = first_request_released.clone();
+                let valid_refresh_token = valid_refresh_token.clone();
+                let request_count = request_count.clone();
+                move |mut request| {
+                    let first_request_released = first_request_released.clone();
+                    let valid_refresh_token = valid_refresh_token.clone();
+                    let request_index = request_count.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        let mut body = String::new();
+                        request.body_mut().read_to_string(&mut body).await?;
+                        let refresh_token = url::form_urlencoded::parse(body.as_bytes())
+                            .find(|(key, _)| key == "refresh_token")
+                            .map(|(_, value)| value.into_owned())
+                            .context("refresh_token missing from request")?;
+
+                        if request_index == 0 {
+                            let receiver = first_request_released
+                                .lock()
+                                .take()
+                                .context("first request release receiver missing")?;
+                            receiver.await.context("first request was not released")?;
+                        }
+
+                        let mut valid_refresh_token = valid_refresh_token.lock();
+                        if refresh_token != *valid_refresh_token {
+                            return json_response(400, r#"{"error":"invalid_grant"}"#);
+                        }
+                        let next_refresh_token = if *valid_refresh_token == "refresh-0" {
+                            "refresh-1"
+                        } else {
+                            "refresh-2"
+                        };
+                        *valid_refresh_token = next_refresh_token.to_string();
+                        json_response(
+                            200,
+                            &format!(
+                                r#"{{"access_token":"new-access","refresh_token":"{next_refresh_token}","expires_in":3600}}"#
+                            ),
+                        )
+                    })
+                }
+            });
+
+            let session = make_test_session(
+                "expired-access",
+                Some("refresh-0"),
+                Some(SystemTime::now() - Duration::from_secs(60)),
+            );
+            let first_provider =
+                McpOAuthTokenProvider::new(session.clone(), http_client.clone(), None);
+            let second_provider = McpOAuthTokenProvider::new(session, http_client, None);
+            let first_refresh = first_provider.try_refresh();
+            let second_refresh = second_provider.try_refresh();
+            futures::pin_mut!(first_refresh, second_refresh);
+
+            assert!(matches!(
+                futures::poll!(first_refresh.as_mut()),
+                Poll::Pending
+            ));
+            let second_result = match futures::poll!(second_refresh.as_mut()) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            };
+            release_first_request
+                .send(())
+                .expect("first request should still be waiting");
+
+            let first_result = first_refresh.await.expect("first refresh should finish");
+            let second_result = match second_result {
+                Some(result) => result,
+                None => second_refresh.await,
+            }
+            .expect("second refresh should finish");
+            assert_eq!(
+                (first_result, second_result),
+                (true, true),
+                "independent providers for the same session should not invalidate one another"
+            );
+            assert_eq!(
+                request_count.load(Ordering::SeqCst),
+                1,
+                "concurrent callers should not reuse a rotating refresh token"
+            );
+        });
+    }
 }
